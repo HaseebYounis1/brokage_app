@@ -101,9 +101,10 @@ def load_data(uploaded_file):
     try:
         if uploaded_file.name.endswith('.csv'):
             try:
-                content = uploaded_file.read().decode('utf-8')
-                uploaded_file.seek(0)
-                if ';' in content.splitlines()[0]:
+                # Read the raw content to check for delimiter
+                content_peek = uploaded_file.read(1024).decode('utf-8', errors='ignore') # Read first 1KB
+                uploaded_file.seek(0) # Reset buffer
+                if ';' in content_peek.splitlines()[0]: # Check header line for semicolon
                     df = pd.read_csv(uploaded_file, delimiter=';')
                 else:
                     df = pd.read_csv(uploaded_file)
@@ -116,24 +117,58 @@ def load_data(uploaded_file):
             st.error("Unsupported file type. Please upload .csv, .xlsx, or .xls")
             return None
 
+        # --- Date Parsing Start ---
         if 'Date' not in df.columns:
             st.error("Critical Error: 'Date' column is missing in the uploaded file.")
             return None
         try:
-            df['Date'] = pd.to_datetime(df['Date'])
-        except Exception as e_date:
-            st.error(f"Error parsing 'Date' column: {e_date}. Please ensure dates are in a recognizable format.")
+            # Make a copy of original date strings for robust error reporting
+            original_date_strings = df['Date'].astype(str).copy()
+
+            # Use format='mixed' to allow pandas to infer the format for each element individually.
+            # This is robust for columns with slight variations in ISO8601 date string format
+            # (e.g., with/without fractional seconds, different timezone representations if any beyond 'Z').
+            # errors='coerce' will turn unparseable dates into NaT (Not a Time).
+            df['Date'] = pd.to_datetime(original_date_strings, format='mixed', errors='coerce')
+
+            if df['Date'].isnull().any():
+                num_failed = df['Date'].isnull().sum()
+                failed_mask = df['Date'].isnull()
+                # Get unique original problematic strings
+                example_failed_values = original_date_strings[failed_mask].unique()[:3]
+
+                st.error(
+                    f"Error parsing 'Date' column: {num_failed} date(s) could not be converted. "
+                    f"Please ensure all dates are in a recognizable format (e.g., YYYY-MM-DD, YYYY-MM-DD HH:MM:SS, or ISO8601 variants like '2024-06-07T16:52:58.164724Z' or '2025-04-03T14:27:24Z'). "
+                    f"Example(s) of problematic date strings from your file: {', '.join(example_failed_values)}. "
+                    "Rows with unparseable dates cannot be processed correctly."
+                )
+                return None # Stop processing if dates are bad
+        except Exception as e_date: # Catch other potential errors during conversion
+            st.error(f"An unexpected error occurred while parsing 'Date' column: {e_date}. Please check date formats in your file.")
             return None
+        # --- Date Parsing End ---
         
         df = df.sort_values(by='Date', ascending=True).reset_index(drop=True)
+
+        # Standardize common column name variations BEFORE checking for required columns
+        column_name_map = {
+            "Total Amo": "Total Amount",
+            "Price per s": "Price per share",
+            # Add other common variations if needed
+        }
+        df.rename(columns=column_name_map, inplace=True)
+
+
         if 'Type' not in df.columns:
             st.error("Critical Error: 'Type' column (transaction type) is missing.")
             return None
         df['Type'] = df['Type'].astype(str).str.strip().str.upper()
 
-        df = normalize_to_usd(df)
+        df = normalize_to_usd(df) # This function now expects "Total Amount"
         if df is None: return None
-        df.dropna(subset=['Amount', 'Type'], inplace=True)
+
+        df.dropna(subset=['Amount', 'Type'], inplace=True) # Amount is Amount_USD
         return df
     except Exception as e:
         st.error(f"Error loading or parsing the file: {e}")
@@ -542,11 +577,18 @@ if 'transactions_df' in st.session_state and st.session_state.transactions_df is
                                'Original_Currency', 'Original_Amount', 'FX Rate',
                                'Amount', 'Price_per_share_USD']
         display_cols_all_tx_filtered = [col for col in display_cols_all_tx if col in df_analysis.columns]
-        st.dataframe(df_analysis[display_cols_all_tx_filtered].sort_values(by='Date', ascending=False).style.format({
+        # Create a copy for display to avoid modifying df_analysis directly if needed elsewhere
+        df_display_all_tx = df_analysis[display_cols_all_tx_filtered].sort_values(by='Date', ascending=False).copy()
+
+        # Convert Date to string, NaT will become 'NaT'
+        if 'Date' in df_display_all_tx.columns:
+            df_display_all_tx['Date'] = df_display_all_tx['Date'].astype(str) 
+
+        st.dataframe(df_display_all_tx.style.format({
             "Original_Amount": "{:,.2f}", "Amount": "${:,.2f}",
             "Price per share": "{:,.2f}", "Price_per_share_USD": "${:,.2f}",
-            "FX Rate": "{:.4f}", "Quantity": "{:.4f}",
-            "Date": "{:%Y-%m-%d %H:%M:%S}"
+            "FX Rate": "{:.4f}", "Quantity": "{:.4f}"
+            # No specific "Date" formatter here, as it's already string
         }))
 
     with tab5:
