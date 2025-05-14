@@ -3,17 +3,28 @@ import pandas as pd
 import altair as alt
 import numpy as np
 import yfinance as yf
-from datetime import datetime
+from datetime import datetime, timedelta
+from io import StringIO
 
 # --- Configuration ---
 st.set_page_config(layout="wide", page_title="Brokerage Account Analyzer Pro")
+
+# --- Session State Initialization ---
+if 'transactions_df' not in st.session_state:
+    st.session_state.transactions_df = pd.DataFrame()
+if 'manual_entries' not in st.session_state:
+    st.session_state.manual_entries = []
+if 'eur_usd_rate' not in st.session_state:
+    st.session_state.eur_usd_rate = None
+if 'last_fx_fetch_time' not in st.session_state:
+    st.session_state.last_fx_fetch_time = None
 
 # --- Helper Functions ---
 def clean_monetary_value(value):
     if isinstance(value, (int, float)):
         return float(value)
     if isinstance(value, str):
-        symbols_to_remove = ['$', '€', 'â‚¬', 'USD', 'EUR', ' ', ','] # Added comma
+        symbols_to_remove = ['$', '€', 'â‚¬', 'USD', 'EUR', ' ', ',']
         for symbol in symbols_to_remove:
             value = value.replace(symbol, '')
         try:
@@ -22,41 +33,76 @@ def clean_monetary_value(value):
             return np.nan
     return np.nan
 
+def fetch_eur_usd_rate():
+    """Fetches the latest EUR/USD exchange rate."""
+    now = datetime.now()
+    # Fetch only once per session or if older than 1 hour
+    if st.session_state.eur_usd_rate and st.session_state.last_fx_fetch_time and \
+       (now - st.session_state.last_fx_fetch_time < timedelta(hours=1)):
+        return st.session_state.eur_usd_rate
+
+    try:
+        ticker = yf.Ticker("EURUSD=X")
+        hist = ticker.history(period="2d")
+        if not hist.empty:
+            rate = hist['Close'].iloc[-1]
+            st.session_state.eur_usd_rate = rate
+            st.session_state.last_fx_fetch_time = now
+            return rate
+        return None # Fallback if yfinance fails
+    except Exception:
+        return None
+
+def convert_usd_to_display_currency(amount_usd, display_currency, eur_usd_rate):
+    if display_currency == "EUR" and eur_usd_rate is not None and eur_usd_rate != 0:
+        return amount_usd / eur_usd_rate
+    return amount_usd # Default to USD or if rate is unavailable
+
+def format_currency(amount, display_currency, eur_usd_rate):
+    target_amount = convert_usd_to_display_currency(amount, display_currency, eur_usd_rate)
+    symbol = "€" if display_currency == "EUR" else "$"
+    return f"{symbol}{target_amount:,.2f}"
+
+
 def normalize_to_usd(df):
     df_copy = df.copy()
-
-    # Preserve original amount and currency for other calculations (e.g., EUR investment)
-    if 'Total Amount' in df_copy.columns:
-        df_copy['Original_Amount'] = df_copy['Total Amount'].apply(clean_monetary_value)
-    else:
-        st.error("Critical Error: 'Total Amount' column is missing.")
+    required_cols = ['Total Amount', 'Currency']
+    if not all(col in df_copy.columns for col in required_cols):
+        st.error(f"Critical Error: One or more required columns ({', '.join(required_cols)}) are missing for currency normalization.")
         return None
-    if 'Currency' in df_copy.columns:
-        df_copy['Original_Currency'] = df_copy['Currency'] # Preserve original currency string
 
-    df_copy['Amount_Cleaned'] = df_copy['Original_Amount'] # Already cleaned
+    df_copy['Original_Amount'] = df_copy['Total Amount'].apply(clean_monetary_value)
+    df_copy['Original_Currency'] = df_copy['Currency'].astype(str).str.upper()
 
+    df_copy['Price_per_share_Cleaned'] = np.nan
     if 'Price per share' in df_copy.columns:
         df_copy['Price_per_share_Cleaned'] = df_copy['Price per share'].apply(clean_monetary_value)
-    else:
-        df_copy['Price_per_share_Cleaned'] = np.nan
 
-    df_copy['Amount_USD'] = df_copy['Amount_Cleaned']
+    # Initialize USD columns with cleaned original values
+    df_copy['Amount_USD'] = df_copy['Original_Amount']
     df_copy['Price_per_share_USD'] = df_copy['Price_per_share_Cleaned']
 
-    if 'Original_Currency' in df_copy.columns and 'FX Rate' in df_copy.columns:
-        df_copy['FX Rate'] = pd.to_numeric(df_copy['FX Rate'], errors='coerce').fillna(1.0)
-        # Ensure 'Original_Currency' is treated as string for comparison
-        usd_conversion_needed_mask = (df_copy['Original_Currency'].astype(str).str.upper() != 'USD') & \
-                                     (df_copy['FX Rate'] != 1.0) & \
-                                     (df_copy['FX Rate'].notna())
+    # Apply FX Rate for conversion if currency is not USD
+    if 'FX Rate' in df_copy.columns:
+        df_copy['FX Rate'] = pd.to_numeric(df_copy['FX Rate'], errors='coerce')
+        
+        # Rows needing conversion: Original currency is not USD, and FX Rate is valid
+        conversion_needed_mask = (df_copy['Original_Currency'] != 'USD') & (df_copy['FX Rate'].notna()) & (df_copy['FX Rate'] != 0)
 
-        df_copy.loc[usd_conversion_needed_mask, 'Amount_USD'] = \
-            df_copy.loc[usd_conversion_needed_mask, 'Amount_Cleaned'] * df_copy.loc[usd_conversion_needed_mask, 'FX Rate']
-        df_copy.loc[usd_conversion_needed_mask, 'Price_per_share_USD'] = \
-            df_copy.loc[usd_conversion_needed_mask, 'Price_per_share_Cleaned'] * df_copy.loc[usd_conversion_needed_mask, 'FX Rate']
+        df_copy.loc[conversion_needed_mask, 'Amount_USD'] = \
+            df_copy.loc[conversion_needed_mask, 'Original_Amount'] * df_copy.loc[conversion_needed_mask, 'FX Rate']
+        df_copy.loc[conversion_needed_mask, 'Price_per_share_USD'] = \
+            df_copy.loc[conversion_needed_mask, 'Price_per_share_Cleaned'] * df_copy.loc[conversion_needed_mask, 'FX Rate']
+        
+        # Fill FX rate with 1.0 for USD transactions or where FX rate was missing (to avoid NaN in calculations)
+        df_copy['FX Rate'].fillna(1.0, inplace=True)
+        df_copy.loc[df_copy['Original_Currency'] == 'USD', 'FX Rate'] = 1.0
+
     else:
-        st.warning("Warning: 'Currency' or 'FX Rate' column not found or improperly formatted. Assuming all amounts are in USD or a consistent currency for USD conversion. Live prices will be fetched assuming USD markets.")
+        st.warning("Warning: 'FX Rate' column not found. Assuming amounts in 'USD' currency are already USD. Other currencies might not be converted correctly without an FX rate.")
+        # For non-USD rows without FX Rate, Amount_USD will remain Original_Amount, which might be incorrect.
+        # User needs to ensure data quality or provide FX rates.
+        df_copy['FX Rate'] = 1.0 # Create a dummy column
 
     df_copy.rename(columns={'Amount_USD': 'Amount'}, inplace=True) # 'Amount' will now refer to Amount_USD
     return df_copy
@@ -64,163 +110,202 @@ def normalize_to_usd(df):
 
 def load_data(uploaded_file):
     try:
-        df = pd.read_excel(uploaded_file, engine='openpyxl')
-        if 'Date' not in df.columns:
-            st.error("Critical Error: 'Date' column is missing.")
+        if uploaded_file.name.endswith('.csv'):
+            # Try to sniff delimiter, or assume comma
+            try:
+                content = uploaded_file.read().decode('utf-8')
+                uploaded_file.seek(0) # Reset buffer
+                # Basic sniff for common delimiters
+                if ';' in content.splitlines()[0]: # Check header
+                    df = pd.read_csv(uploaded_file, delimiter=';')
+                else:
+                    df = pd.read_csv(uploaded_file)
+            except Exception as e_csv:
+                 st.error(f"Error reading CSV: {e_csv}. Ensure it's a standard comma or semicolon-separated file.")
+                 return None
+        elif uploaded_file.name.endswith(('.xlsx', '.xls')):
+            df = pd.read_excel(uploaded_file, engine='openpyxl')
+        else:
+            st.error("Unsupported file type. Please upload .csv, .xlsx, or .xls")
             return None
-        df['Date'] = pd.to_datetime(df['Date'])
-        # Attempt to sort by Date and potentially a sub-second column if it exists, to ensure order
-        # If you have a 'Time' column or your 'Date' column has time precise enough:
-        # df = df.sort_values(by=['Date', 'Time_Column_If_Any'], ascending=[True, True])
-        # For now, just date:
+
+        if 'Date' not in df.columns:
+            st.error("Critical Error: 'Date' column is missing in the uploaded file.")
+            return None
+        try:
+            df['Date'] = pd.to_datetime(df['Date'])
+        except Exception as e_date:
+            st.error(f"Error parsing 'Date' column: {e_date}. Please ensure dates are in a recognizable format.")
+            return None
+        
         df = df.sort_values(by='Date', ascending=True).reset_index(drop=True)
 
+        # Ensure 'Type' column exists
+        if 'Type' not in df.columns:
+            st.error("Critical Error: 'Type' column (transaction type) is missing.")
+            return None
+        df['Type'] = df['Type'].astype(str).str.strip().str.upper() # Standardize type
 
         df = normalize_to_usd(df)
         if df is None: return None
+
+        # Drop rows where essential normalized 'Amount' or 'Type' is NaN
         df.dropna(subset=['Amount', 'Type'], inplace=True)
         return df
     except Exception as e:
-        st.error(f"Error loading or parsing the Excel file: {e}")
+        st.error(f"Error loading or parsing the file: {e}")
         return None
 
 def get_live_price(ticker_symbol, last_known_price_usd_from_data):
-    if ticker_symbol.endswith('Q'):
+    if pd.isna(ticker_symbol) or not isinstance(ticker_symbol, str):
+        return 0.0, "Invalid Ticker"
+    if ticker_symbol.endswith('Q'): # Convention for delisted/bankrupt
         return 0.0, "Delisted/Bankrupt (Value $0)"
     try:
         ticker = yf.Ticker(ticker_symbol)
-        hist = ticker.history(period="2d")
+        # Fetch a bit more data to ensure we get the most recent close
+        hist = ticker.history(period="5d") # Changed to 5d for resilience
         if not hist.empty and 'Close' in hist.columns:
             live_price = hist['Close'].iloc[-1]
-            return live_price, "Live Market"
-        st.warning(f"Could not fetch recent history for {ticker_symbol} via yfinance. Using last transaction price as fallback.")
-        return last_known_price_usd_from_data, "Last Txn Price (Fallback)"
-    except Exception: # Catch broad exceptions from yf
-        # st.warning(f"Failed to fetch live price for {ticker_symbol} from yfinance: {str(e)[:100]}. Using last transaction price.")
+            # Check if the price is recent (e.g., within last few days, yfinance might give old data for illiquid stocks)
+            if hist.index[-1].date() >= (datetime.now() - timedelta(days=7)).date():
+                 return live_price, "Live Market"
+            else:
+                 st.warning(f"Price for {ticker_symbol} from yfinance is older than 7 days. Using last transaction price as fallback.")
+                 return last_known_price_usd_from_data, "Last Txn Price (Stale Live Data)"
+        st.warning(f"Could not fetch recent history for {ticker_symbol}. Using last transaction price.")
+        return last_known_price_usd_from_data, "Last Txn Price (No Live Data)"
+    except Exception:
         return last_known_price_usd_from_data, "Last Txn Price (API Error)"
 
 def calculate_total_invested_in_currency(df, target_currency="EUR"):
-    """Calculates total amount invested (buys) in a specific original currency."""
     if df is None or not all(col in df.columns for col in ['Original_Amount', 'Original_Currency', 'Type']):
         return 0
-    
-    # Filter for buy transactions in the target currency
-    # Ensure 'Original_Currency' is compared as uppercase string
     buy_transactions_in_target_currency = df[
-        (df['Type'].isin(['BUY - MARKET'])) &
+        (df['Type'].str.contains('BUY', case=False)) & # More flexible BUY type matching
         (df['Original_Currency'].astype(str).str.upper() == target_currency.upper())
     ]
-    total_invested = buy_transactions_in_target_currency['Original_Amount'].sum()
-    return total_invested
-
+    return buy_transactions_in_target_currency['Original_Amount'].sum()
 
 def calculate_total_deposits(df):
-    if 'CASH TOP-UP' in df['Type'].unique():
-        deposits = df[df['Type'] == 'CASH TOP-UP']['Amount'].sum() # Amount is already USD
-        return deposits
-    return 0
+    if df is None or 'Type' not in df.columns or 'Amount' not in df.columns:
+        return 0
+    # Allow more flexible deposit type matching
+    deposit_types = ['CASH TOP-UP', 'DEPOSIT', 'WIRE IN']
+    deposits = df[df['Type'].str.upper().isin(deposit_types)]['Amount'].sum() # Amount is already USD
+    return deposits
 
 def calculate_portfolio_metrics(df_transactions):
     if df_transactions is None or df_transactions.empty:
-        return 0, 0, pd.DataFrame(), 0, 0, 0
+        return 0, 0, pd.DataFrame(), pd.DataFrame(), 0, 0, 0, 0, 0
 
-    # These are always in USD after normalization
-    buy_types = ['BUY - MARKET']
-    sell_types = ['SELL - MARKET']
-    fee_types = ['CUSTODY FEE', 'FEE', 'SERVICE FEE'] # Ensure 'Amount' for fees is positive debit
-    dividend_types = ['DIVIDEND'] # Ensure 'Amount' for dividends is positive credit
+    # Standardize transaction types
+    BUY_TYPES = ['BUY - MARKET', 'BUY']
+    SELL_TYPES = ['SELL - MARKET', 'SELL']
+    FEE_TYPES = ['CUSTODY FEE', 'FEE', 'SERVICE FEE', 'COMMISSION']
+    DIVIDEND_TYPES = ['DIVIDEND', 'DIVIDEND INCOME']
+    CASH_TOP_UP_TYPES = ['CASH TOP-UP', 'DEPOSIT']
 
-    # Overall sums for P&L calculation (all in USD)
-    grand_total_cost_of_all_buys_usd = df_transactions[df_transactions['Type'].isin(buy_types)]['Amount'].sum()
-    grand_total_proceeds_from_all_sells_usd = df_transactions[df_transactions['Type'].isin(sell_types)]['Amount'].sum()
-    grand_total_dividends_received_usd = df_transactions[df_transactions['Type'].isin(dividend_types)]['Amount'].sum()
-    grand_total_fees_paid_usd = df_transactions[df_transactions['Type'].isin(fee_types)]['Amount'].sum()
+    # Convert 'Quantity' to numeric, coercing errors. Fill NaNs with 0.
+    df_transactions['Quantity'] = pd.to_numeric(df_transactions['Quantity'], errors='coerce').fillna(0)
 
 
-    # For tracking holdings and average costs (all in USD)
-    # This dictionary will store: quantity, total_cost_of_held_shares, weighted_avg_buy_price_of_held
+    grand_total_cost_of_all_buys_usd = df_transactions[df_transactions['Type'].isin(BUY_TYPES)]['Amount'].sum()
+    grand_total_proceeds_from_all_sells_usd = df_transactions[df_transactions['Type'].isin(SELL_TYPES)]['Amount'].sum()
+    grand_total_dividends_received_usd = df_transactions[df_transactions['Type'].isin(DIVIDEND_TYPES)]['Amount'].sum()
+    grand_total_fees_paid_usd = df_transactions[df_transactions['Type'].isin(FEE_TYPES)]['Amount'].sum()
+
     live_holdings = {}
-    total_realized_pl_from_sales_usd = 0.0 # Accumulator for P/L from actual sales
+    completed_transactions_data = [] # For the new table
 
-    # Get last transaction prices (USD) as a base for fallback if yfinance fails
     last_transaction_prices_usd_from_data = {}
     if 'Price_per_share_USD' in df_transactions.columns and 'Ticker' in df_transactions.columns:
         last_transaction_prices_usd_from_data = df_transactions.dropna(subset=['Price_per_share_USD', 'Ticker'])\
                                                .groupby('Ticker')['Price_per_share_USD'].last().to_dict()
 
-    # Process transactions chronologically (already sorted in load_data)
     for index, row in df_transactions.iterrows():
         ticker = row.get('Ticker')
         tx_type = row.get('Type')
-        quantity = row.get('Quantity', 0) # Default to 0 if missing
-        amount_usd = row.get('Amount', 0) # This is Amount_USD
-        price_per_share_usd = row.get('Price_per_share_USD', 0) #This is Price_per_share_USD
+        quantity = row.get('Quantity', 0)
+        amount_usd = row.get('Amount', 0)
+        price_per_share_usd = row.get('Price_per_share_USD', 0)
+        tx_date = row.get('Date')
 
-        if pd.isna(ticker) and tx_type not in fee_types + dividend_types + ['CASH TOP-UP']: # Ticker needed for buy/sell
+        if pd.isna(ticker) and tx_type not in FEE_TYPES + DIVIDEND_TYPES + CASH_TOP_UP_TYPES:
             continue
-        if pd.isna(quantity) and tx_type in buy_types + sell_types: # Quantity needed for buy/sell
+        if pd.isna(quantity) and tx_type in BUY_TYPES + SELL_TYPES:
             continue
 
-
-        if tx_type in buy_types:
+        if tx_type in BUY_TYPES:
             if ticker not in live_holdings:
                 live_holdings[ticker] = {'quantity': 0, 'cost_basis_held_usd': 0.0, 'avg_buy_price_held_usd': 0.0}
-
+            
             current_qty = live_holdings[ticker]['quantity']
             current_cost_basis = live_holdings[ticker]['cost_basis_held_usd']
-
-            # Update holdings
+            
             new_quantity = current_qty + quantity
-            new_cost_basis = current_cost_basis + amount_usd # amount_usd is total cost of this buy txn
+            new_cost_basis = current_cost_basis + amount_usd
 
             live_holdings[ticker]['quantity'] = new_quantity
             live_holdings[ticker]['cost_basis_held_usd'] = new_cost_basis
-            if new_quantity > 0: # Avoid division by zero
+            if new_quantity > 0.000001: # Float precision
                 live_holdings[ticker]['avg_buy_price_held_usd'] = new_cost_basis / new_quantity
-            else: # Should not happen if quantity > 0 for a buy
-                 live_holdings[ticker]['avg_buy_price_held_usd'] = 0
+            else:
+                live_holdings[ticker]['avg_buy_price_held_usd'] = 0
 
+        elif tx_type in SELL_TYPES:
+            if ticker in live_holdings and live_holdings[ticker]['quantity'] > 0.000001:
+                avg_buy_price_at_sale_usd = live_holdings[ticker]['avg_buy_price_held_usd']
+                # Ensure selling no more than held, can happen with fractional shares or data errors
+                sold_quantity = min(quantity, live_holdings[ticker]['quantity'])
 
-        elif tx_type in sell_types:
-            if ticker in live_holdings and live_holdings[ticker]['quantity'] > 0:
-                avg_buy_price_at_sale = live_holdings[ticker]['avg_buy_price_held_usd']
-                sold_quantity = min(quantity, live_holdings[ticker]['quantity']) # Cannot sell more than held
+                cost_of_goods_sold_usd = sold_quantity * avg_buy_price_at_sale_usd
+                proceeds_this_sale_usd = amount_usd # amount_usd is total proceeds for this sell txn
+                
+                # If price_per_share_usd is not available from the row (e.g. missing data),
+                # try to derive it from amount_usd and sold_quantity.
+                # This is important for accurate sell price display.
+                actual_sell_price_per_share_usd = price_per_share_usd
+                if (pd.isna(actual_sell_price_per_share_usd) or actual_sell_price_per_share_usd == 0) and sold_quantity > 0:
+                    actual_sell_price_per_share_usd = proceeds_this_sale_usd / sold_quantity
 
-                cost_of_goods_sold = sold_quantity * avg_buy_price_at_sale
-                proceeds_this_sale = amount_usd # amount_usd is total proceeds of this sell txn
-                realized_pl_this_sale = proceeds_this_sale - cost_of_goods_sold
-                total_realized_pl_from_sales_usd += realized_pl_this_sale
+                realized_pl_this_sale_usd = proceeds_this_sale_usd - cost_of_goods_sold_usd
 
-                # Update holdings
+                completed_transactions_data.append({
+                    'Date': tx_date,
+                    'Ticker': ticker,
+                    'Quantity Sold': sold_quantity,
+                    'Avg. Buy Price (USD)': avg_buy_price_at_sale_usd,
+                    'Sell Price p.s. (USD)': actual_sell_price_per_share_usd, # Use actual/derived sell price
+                    'Cost Basis Sold (USD)': cost_of_goods_sold_usd,
+                    'Total Proceeds (USD)': proceeds_this_sale_usd,
+                    'Realized P/L (USD)': realized_pl_this_sale_usd
+                })
+
                 live_holdings[ticker]['quantity'] -= sold_quantity
-                live_holdings[ticker]['cost_basis_held_usd'] -= cost_of_goods_sold
-                # avg_buy_price_held_usd remains the same for the shares still held
+                live_holdings[ticker]['cost_basis_held_usd'] -= cost_of_goods_sold_usd
+                
+                if live_holdings[ticker]['quantity'] <= 0.00001:
+                    del live_holdings[ticker]
+            # else: sell of untracked stock or more than available - could log a warning
 
-                if live_holdings[ticker]['quantity'] <= 0.00001: # Handle float precision
-                    del live_holdings[ticker] # Remove if all sold
-            # else: sell of untracked stock or more than available - can be warning
-
-    # --- Calculate Current Portfolio Value using live prices ---
     current_portfolio_market_value_usd = 0
     holdings_df_data = []
     live_prices_fetched_count = 0
     
     total_investment_in_q_stocks_usd = df_transactions[
-        (df_transactions['Type'].isin(buy_types)) &
+        (df_transactions['Type'].isin(BUY_TYPES)) &
         (df_transactions['Ticker'].astype(str).str.endswith('Q'))
     ]['Amount'].sum()
 
-
-    if live_holdings: # Check if there are any holdings left
-        st.write("Fetching live prices for current holdings (this may take a moment)...")
-        progress_bar = st.progress(0)
+    if live_holdings:
+        # st.write("Fetching live prices for current holdings...") # Can be noisy if called often
+        # progress_bar = st.progress(0) # Consider removing progress bar for faster feel on reruns
         num_holdings_to_fetch = len(live_holdings)
         fetched_count = 0
-
         for ticker, data in live_holdings.items():
-            if data['quantity'] > 0.00001: # If shares are held
+            if data['quantity'] > 0.00001:
                 last_known_price_usd = last_transaction_prices_usd_from_data.get(ticker, data['avg_buy_price_held_usd'])
-
                 live_price_usd, price_source = get_live_price(ticker, last_known_price_usd)
                 if price_source == "Live Market":
                     live_prices_fetched_count += 1
@@ -228,7 +313,7 @@ def calculate_portfolio_metrics(df_transactions):
                 market_value_of_holding = data['quantity'] * live_price_usd
                 current_portfolio_market_value_usd += market_value_of_holding
                 unrealized_pl_holding = market_value_of_holding - data['cost_basis_held_usd']
-                percent_unrealized_pl = (unrealized_pl_holding / data['cost_basis_held_usd']) * 100 if data['cost_basis_held_usd'] != 0 else 0
+                percent_unrealized_pl = (unrealized_pl_holding / data['cost_basis_held_usd'] * 100) if data['cost_basis_held_usd'] != 0 else 0
 
                 holdings_df_data.append({
                     'Ticker': ticker,
@@ -242,161 +327,382 @@ def calculate_portfolio_metrics(df_transactions):
                     '% Unrealized P/L': percent_unrealized_pl
                 })
             fetched_count += 1
-            progress_bar.progress(fetched_count / num_holdings_to_fetch)
-        progress_bar.empty()
+            # progress_bar.progress(fetched_count / num_holdings_to_fetch)
+        # progress_bar.empty()
 
     holdings_df = pd.DataFrame(holdings_df_data)
+    completed_transactions_df = pd.DataFrame(completed_transactions_data)
+    if not completed_transactions_df.empty:
+        completed_transactions_df = completed_transactions_df.sort_values(by="Date", ascending=False)
 
-    # --- Final Overall P&L ---
-    # P/L = (Current Portfolio Value + Total Sells + Total Dividends) - (Total Buys + Total Fees)
+
     overall_net_pl_usd = (current_portfolio_market_value_usd + grand_total_proceeds_from_all_sells_usd + grand_total_dividends_received_usd) - \
                          (grand_total_cost_of_all_buys_usd + grand_total_fees_paid_usd)
+    
+    total_realized_pl_from_sales_usd = 0 # Recalculate from detailed completed transactions if available
+    if not completed_transactions_df.empty:
+        total_realized_pl_from_sales_usd = completed_transactions_df['Realized P/L (USD)'].sum()
 
-    if st.sidebar.checkbox("Show P&L Calculation Breakdown", False):
-        st.sidebar.markdown("---")
-        st.sidebar.subheader("P&L Calculation (USD):")
-        st.sidebar.markdown(f"""
-        **Income Side:**
-        - Est. Current Holdings Market Value: ${current_portfolio_market_value_usd:,.2f}
-        - Total Proceeds from All Sells: ${grand_total_proceeds_from_all_sells_usd:,.2f}
-        - Total Dividends Received: ${grand_total_dividends_received_usd:,.2f}
-        ---
-        **Subtotal (Income Side):** ${(current_portfolio_market_value_usd + grand_total_proceeds_from_all_sells_usd + grand_total_dividends_received_usd):,.2f}
-        
-        **Cost Side:**
-        - Total Cost of All Buys: ${grand_total_cost_of_all_buys_usd:,.2f}
-        - Total Fees Paid: ${grand_total_fees_paid_usd:,.2f}
-        ---
-        **Subtotal (Cost Side):** ${(grand_total_cost_of_all_buys_usd + grand_total_fees_paid_usd):,.2f}
-        ---
-        **Estimated Overall Net P/L:** ${overall_net_pl_usd:,.2f}
-        
-        *Internal check: Total Realized P/L from sales (before dividends/fees): ${total_realized_pl_from_sales_usd:,.2f}*
-        """)
-        st.sidebar.info(f"_{live_prices_fetched_count} ticker(s) updated with live market prices._ Tickers ending in 'Q' are valued at $0.")
 
-    return overall_net_pl_usd, current_portfolio_market_value_usd, holdings_df, live_prices_fetched_count, total_investment_in_q_stocks_usd
+    return (overall_net_pl_usd, current_portfolio_market_value_usd, holdings_df, completed_transactions_df,
+            live_prices_fetched_count, total_investment_in_q_stocks_usd,
+            grand_total_cost_of_all_buys_usd, grand_total_proceeds_from_all_sells_usd,
+            grand_total_dividends_received_usd, grand_total_fees_paid_usd, total_realized_pl_from_sales_usd)
 
 
 # --- Main Application ---
 st.title("📈 Brokerage Account Analyzer Pro")
-st.markdown(f"As of: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (Live prices fetched on data load)")
 
-st.sidebar.header("📂 Upload Data")
-uploaded_file = st.sidebar.file_uploader("Upload your Excel transactions file (.xlsx, .xls)", type=["xlsx", "xls"])
+# --- Sidebar for Upload, Manual Entry, and Settings ---
+st.sidebar.header("⚙️ Settings & Data Input")
 
+# Currency Display Setting
+display_currency = st.sidebar.selectbox("Display Monetary Values In:", ["USD", "EUR"], key="display_currency_select")
+eur_usd_live_rate = fetch_eur_usd_rate()
+
+if display_currency == "EUR":
+    if eur_usd_live_rate:
+        st.sidebar.caption(f"Using EUR/USD: {eur_usd_live_rate:.4f} (live rate)")
+    else:
+        st.sidebar.warning("Could not fetch live EUR/USD rate. EUR values may not be accurate.")
+
+# File Uploader
+uploaded_file = st.sidebar.file_uploader("Upload Transactions File (.xlsx, .xls, .csv)", type=["xlsx", "xls", "csv"])
+
+# Manual Transaction Entry
+st.sidebar.subheader("✍️ Manual Transaction Entry")
+with st.sidebar.expander("Add a Transaction"):
+    with st.form("manual_transaction_form", clear_on_submit=True):
+        mt_date = st.date_input("Date", value=datetime.now())
+        mt_ticker = st.text_input("Ticker")
+        mt_type = st.selectbox("Type", ["BUY - MARKET", "SELL - MARKET", "DIVIDEND", "CASH TOP-UP", "FEE", "CUSTODY FEE", "SERVICE FEE"])
+        mt_quantity = st.number_input("Quantity", min_value=0.0, step=0.0001, format="%.4f")
+        mt_price_per_share = st.number_input("Price per Share (in transaction currency)", min_value=0.0, format="%.4f")
+        mt_total_amount = st.number_input("Total Amount (in transaction currency, overrides PxQ)", min_value=0.0, format="%.2f")
+        mt_currency = st.selectbox("Currency", ["USD", "EUR", "GBP", "CAD", "Other"], index=0)
+        mt_fx_rate = st.number_input("FX Rate (to USD, e.g., EUR to USD rate if currency is EUR)", value=1.0, min_value=0.0, format="%.6f",
+                                     help="If currency is USD, FX rate is 1. If EUR, provide EUR/USD rate at time of transaction.")
+        submitted = st.form_submit_button("Add Transaction")
+
+        if submitted:
+            if not mt_ticker and mt_type not in ["CASH TOP-UP", "FEE", "CUSTODY FEE", "SERVICE FEE"]: # Ticker not needed for cash/general fees
+                st.error("Ticker is required for Buy/Sell/Dividend transactions.")
+            else:
+                # Use total amount if provided, else calculate from price and quantity
+                final_total_amount = mt_total_amount if mt_total_amount > 0 else mt_quantity * mt_price_per_share
+                
+                # For dividends/fees, quantity might not be relevant, ensure price per share is handled.
+                # Often total amount is primary for these.
+                final_price_per_share = mt_price_per_share
+                if mt_type in ["DIVIDEND", "FEE", "CUSTODY FEE", "SERVICE FEE"] and mt_quantity == 0 and final_total_amount > 0:
+                    # If quantity is 0 but total amount is given, price per share isn't really applicable in the same way
+                    final_price_per_share = np.nan # Or 0, or total_amount if conceptually representing "price" of the event
+                
+                new_entry = {
+                    'Date': pd.to_datetime(mt_date),
+                    'Ticker': mt_ticker.upper() if mt_ticker else None,
+                    'Type': mt_type.upper(),
+                    'Quantity': mt_quantity,
+                    'Price per share': final_price_per_share,
+                    'Total Amount': final_total_amount,
+                    'Currency': mt_currency,
+                    'FX Rate': mt_fx_rate
+                }
+                st.session_state.manual_entries.append(new_entry)
+                st.success(f"Added {mt_type} for {mt_ticker or 'N/A'} to temporary list.")
+
+if st.session_state.manual_entries:
+    if st.sidebar.button("Clear Manually Added Transactions"):
+        st.session_state.manual_entries = []
+        st.sidebar.success("Manually added transactions cleared.")
+        st.experimental_rerun() # Rerun to reflect clearance
+
+# --- Data Loading and Processing ---
 if uploaded_file:
-    df_transactions_loaded = load_data(uploaded_file)
+    df_loaded = load_data(uploaded_file)
+    if df_loaded is not None:
+        st.session_state.transactions_df = df_loaded
+        st.session_state.manual_entries = [] # Clear manual entries if new file is loaded
+        st.success("File uploaded and processed successfully!")
+elif st.session_state.manual_entries and st.session_state.transactions_df.empty:
+    # If only manual entries exist, use them
+    st.session_state.transactions_df = pd.DataFrame(st.session_state.manual_entries)
+    st.session_state.transactions_df = normalize_to_usd(st.session_state.transactions_df) # Important to normalize
+    if st.session_state.transactions_df is not None:
+         st.session_state.transactions_df['Date'] = pd.to_datetime(st.session_state.transactions_df['Date'])
+         st.session_state.transactions_df = st.session_state.transactions_df.sort_values(by='Date', ascending=True).reset_index(drop=True)
 
-    if df_transactions_loaded is not None and not df_transactions_loaded.empty:
-        st.success("File processed! Monetary values below are in USD (converted via FX rates if provided).")
 
-        # --- Key Metrics ---
-        total_deposited_usd = calculate_total_deposits(df_transactions_loaded)
-        total_invested_eur = calculate_total_invested_in_currency(df_transactions_loaded, "EUR")
-        # Add other currencies if needed: total_invested_gbp = calculate_total_invested_in_currency(df_transactions_loaded, "GBP")
+# Combine file data with further manual entries if both exist
+if not st.session_state.transactions_df.empty and st.session_state.manual_entries:
+    manual_df = pd.DataFrame(st.session_state.manual_entries)
+    manual_df = normalize_to_usd(manual_df) # Normalize new manual entries
+    if manual_df is not None:
+        manual_df['Date'] = pd.to_datetime(manual_df['Date'])
+        st.session_state.transactions_df = pd.concat([st.session_state.transactions_df, manual_df], ignore_index=True)
+        st.session_state.transactions_df = st.session_state.transactions_df.sort_values(by='Date', ascending=True).reset_index(drop=True)
+        st.session_state.manual_entries = [] # Clear after adding them to main df
+        st.info("Manually added transactions have been merged with the uploaded data.")
 
 
-        overall_pl_usd, current_mkt_val_usd, df_holdings, live_cnt, investment_q_usd = \
-            calculate_portfolio_metrics(df_transactions_loaded)
+# --- Main Analysis Area ---
+if 'transactions_df' in st.session_state and st.session_state.transactions_df is not None and not st.session_state.transactions_df.empty:
+    df_analysis = st.session_state.transactions_df.copy()
 
-        st.subheader("📊 Key Financial Metrics")
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Total Deposited (Cash Top-ups, USD)", f"${total_deposited_usd:,.2f}")
-        col2.metric("Est. Current Portfolio Market Value (USD)", f"${current_mkt_val_usd:,.2f}",
-                    help="Based on live market prices (or $0 for 'Q' stocks, fallback to last txn price).")
-        col3.metric("Est. Overall Net Profit/Loss (USD)", f"${overall_pl_usd:,.2f}",
-                     delta_color="normal" if overall_pl_usd >=0 else "inverse")
+    # --- Calculate Metrics ---
+    (overall_pl_usd, current_mkt_val_usd, df_holdings, df_completed_transactions,
+     live_cnt, investment_q_usd, total_buys_usd, total_sells_usd, total_dividends_usd,
+     total_fees_usd, total_realized_pl_sales_usd) = calculate_portfolio_metrics(df_analysis)
+
+    total_deposited_usd = calculate_total_deposits(df_analysis)
+    total_invested_eur_orig = calculate_total_invested_in_currency(df_analysis, "EUR") # Original EUR investment amount
+
+    # --- Display Tabs ---
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Overview", "💼 Current Holdings", "🤝 Completed Transactions", "📋 All Transactions", "📈 Charts"])
+
+    with tab1:
+        st.subheader(" Key Financial Metrics")
+        st.markdown(f"_(Monetary values displayed in {display_currency})_")
+
+        mcol1, mcol2, mcol3 = st.columns(3)
+        mcol1.metric(f"Total Deposited (Cash, {display_currency})",
+                     format_currency(total_deposited_usd, display_currency, eur_usd_live_rate))
+        mcol2.metric(f"Est. Current Portfolio Value ({display_currency})",
+                     format_currency(current_mkt_val_usd, display_currency, eur_usd_live_rate),
+                     help="Based on live market prices (or $0 for 'Q' stocks, fallback to last txn price).")
         
-        if total_invested_eur > 0:
-             st.metric("Total Invested (Buys) in EUR", f"€{total_invested_eur:,.2f}",
-                       help="Sum of 'Total Amount' for BUY transactions where currency was EUR, before FX conversion.")
+        pl_color = "normal" if overall_pl_usd >=0 else "inverse"
+        mcol3.metric(f"Est. Overall Net P/L ({display_currency})",
+                     format_currency(overall_pl_usd, display_currency, eur_usd_live_rate),
+                     delta_color=pl_color)
+
+        if total_invested_eur_orig > 0:
+             st.metric("Total Invested (Original EUR Buys)", f"€{total_invested_eur_orig:,.2f}",
+                       help="Sum of 'Total Amount' for BUY transactions where original currency was EUR, before any FX conversion to USD.")
 
         if investment_q_usd > 0:
-            st.warning(f"⚠️ Total investment (cost of buys) in 'Q' (delisted/bankrupt) stocks: ${investment_q_usd:,.2f} USD. These are currently valued at $0 in your portfolio.")
+            st.warning(f"⚠️ Total investment (cost of buys) in 'Q' (delisted/bankrupt) stocks: {format_currency(investment_q_usd, display_currency, eur_usd_live_rate)}. These are valued at $0.")
 
         if live_cnt > 0:
             st.info(f"💡 Successfully fetched live market prices for {live_cnt} ticker(s).")
         else:
             st.warning("⚠️ Could not fetch any live market prices. Portfolio valuation uses last transaction prices or $0 for 'Q' stocks.")
 
-        # --- Detailed Holdings View ---
         st.markdown("---")
-        st.subheader("💼 Current Holdings (Unsold Shares)")
-        st.write("Detailed breakdown of shares you currently own, valued using live market prices (or fallback).")
-        if not df_holdings.empty:
-            # Sort by Market Value Descending for better view
-            df_holdings_sorted = df_holdings.sort_values(by="Market Value (USD)", ascending=False).reset_index(drop=True)
-            st.dataframe(df_holdings_sorted.style.format({
-                "Quantity": "{:.2f}",
-                "Avg. Buy Price (USD)": "${:,.2f}",
-                "Cost Basis (USD)": "${:,.2f}",
-                "Current Price (USD)": "${:,.2f}",
-                "Market Value (USD)": "${:,.2f}",
-                "Unrealized P/L (USD)": "${:,.2f}",
-                "% Unrealized P/L": "{:.2f}%"
-            }).applymap(lambda val: 'color: red' if isinstance(val, (float, int)) and val < 0 and '%' in str(val) else ('color: green' if isinstance(val, (float, int)) and val > 0 and '%' in str(val) else ''), subset=['% Unrealized P/L'])
-              .applymap(lambda val: 'color: red' if isinstance(val, (float, int)) and val < 0 else ('color: green' if isinstance(val, (float, int)) and val > 0 else ''), subset=['Unrealized P/L (USD)']))
-        else:
-            st.info("No current active holdings to display based on processed transactions.")
-
-        # --- Charts ---
-        st.markdown("---")
-        st.subheader("📈 Transaction Charts (USD)")
-        # (Charts code remains largely the same, ensure 'Amount' used is the USD converted one)
-        if 'CASH TOP-UP' in df_transactions_loaded['Type'].unique():
-            # Charting logic as before
-            deposits_over_time = df_transactions_loaded[df_transactions_loaded['Type'] == 'CASH TOP-UP'].groupby(pd.Grouper(key='Date', freq='M'))['Amount'].sum().reset_index()
-            deposits_over_time['DateStr'] = deposits_over_time['Date'].dt.strftime('%Y-%m')
-            chart_deposits = alt.Chart(deposits_over_time).mark_bar().encode(
-                x=alt.X('DateStr:O', title='Month', sort=None),
-                y=alt.Y('Amount:Q', title='Total Deposits ($ USD)'),
-                tooltip=[alt.Tooltip('DateStr', title='Month'), alt.Tooltip('Amount', title='Deposits ($ USD)', format='$,.2f')]
-            ).properties(title='Monthly Cash Top-ups (USD)')
-            st.altair_chart(chart_deposits, use_container_width=True)
-
-        buys_sells_df = df_transactions_loaded[df_transactions_loaded['Type'].isin(['BUY - MARKET', 'SELL - MARKET'])].copy()
-        if not buys_sells_df.empty:
-            # Charting logic as before
-            buys_sells_over_time = buys_sells_df.groupby([pd.Grouper(key='Date', freq='M'), 'Type'])['Amount'].sum().unstack(fill_value=0).reset_index()
-            buys_sells_over_time['DateStr'] = buys_sells_over_time['Date'].dt.strftime('%Y-%m')
-            buys_sells_over_time_melted = buys_sells_over_time.melt(id_vars=['DateStr', 'Date'], value_vars=['BUY - MARKET', 'SELL - MARKET'], var_name='Transaction Type', value_name='Total Amount ($ USD)')
-            chart_buys_sells = alt.Chart(buys_sells_over_time_melted).mark_line(point=True).encode(
-                x=alt.X('DateStr:O', title='Month', sort=alt.EncodingSortField(field="Date", op="min", order='ascending')),
-                y=alt.Y('Total Amount ($ USD):Q', title='Total Transaction Amount ($ USD)'),
-                color='Transaction Type:N',
-                tooltip=[alt.Tooltip('DateStr', title='Month'), 'Transaction Type', alt.Tooltip('Total Amount ($ USD)', format='$,.2f')]
-            ).properties(title='Monthly Buy vs. Sell Activity (Value in USD)')
-            st.altair_chart(chart_buys_sells, use_container_width=True)
+        st.subheader(f"💰 P&L Calculation Breakdown ({display_currency})")
+        st.markdown(f"""
+        **Income Side:**
+        - Est. Current Holdings Market Value: {format_currency(current_mkt_val_usd, display_currency, eur_usd_live_rate)}
+        - Total Proceeds from All Sells: {format_currency(total_sells_usd, display_currency, eur_usd_live_rate)}
+        - Total Dividends Received: {format_currency(total_dividends_usd, display_currency, eur_usd_live_rate)}
+        ---
+        **Subtotal (Income Side):** {format_currency(current_mkt_val_usd + total_sells_usd + total_dividends_usd, display_currency, eur_usd_live_rate)}
         
-        # Cumulative chart (Optional enhancement: Add cumulative P&L line)
-        # ... (existing cumulative chart code can largely remain)
+        **Cost Side:**
+        - Total Cost of All Buys: {format_currency(total_buys_usd, display_currency, eur_usd_live_rate)}
+        - Total Fees Paid: {format_currency(total_fees_usd, display_currency, eur_usd_live_rate)}
+        ---
+        **Subtotal (Cost Side):** {format_currency(total_buys_usd + total_fees_usd, display_currency, eur_usd_live_rate)}
+        ---
+        **Estimated Overall Net P/L:** {format_currency(overall_pl_usd, display_currency, eur_usd_live_rate)}
+        
+        *Internal check: Total Realized P/L from sales (before dividends/fees): {format_currency(total_realized_pl_sales_usd, display_currency, eur_usd_live_rate)}*
+        """)
 
 
-        st.markdown("---")
-        st.subheader("📋 Processed Transaction Data")
-        st.write("View your uploaded transactions after processing (monetary values converted to USD where applicable, original amounts preserved).")
-        display_cols = ['Date', 'Ticker', 'Type', 'Quantity', 'Price per share', 'Original_Currency', 'Original_Amount', 'FX Rate', 'Amount', 'Price_per_share_USD']
-        display_cols = [col for col in display_cols if col in df_transactions_loaded.columns]
-        st.dataframe(df_transactions_loaded[display_cols].sort_values(by='Date', ascending=False).style.format({
-            "Original_Amount": "{:,.2f}", "Amount": "${:,.2f}", # Amount is USD
+    with tab2:
+        st.subheader(" Current Holdings (Unsold Shares)")
+        st.markdown(f"_(Monetary values displayed in {display_currency})_")
+        if not df_holdings.empty:
+            df_holdings_display = df_holdings.copy()
+            # Convert USD columns to display currency for this table
+            usd_cols_holdings = ['Avg. Buy Price (USD)', 'Cost Basis (USD)', 'Current Price (USD)', 'Market Value (USD)', 'Unrealized P/L (USD)']
+            for col_usd in usd_cols_holdings:
+                new_col_name = col_usd.replace(" (USD)", f" ({display_currency})")
+                df_holdings_display[new_col_name] = df_holdings_display[col_usd].apply(
+                    lambda x: convert_usd_to_display_currency(x, display_currency, eur_usd_live_rate)
+                )
+            
+            display_cols_holdings = ['Ticker', 'Quantity', f'Avg. Buy Price ({display_currency})', 
+                                     f'Cost Basis ({display_currency})', f'Current Price ({display_currency})', 
+                                     'Price Source', f'Market Value ({display_currency})',
+                                     f'Unrealized P/L ({display_currency})', '% Unrealized P/L']
+            
+            df_holdings_sorted = df_holdings_display.sort_values(by=f"Market Value ({display_currency})", ascending=False).reset_index(drop=True)
+            
+            st.dataframe(df_holdings_sorted[display_cols_holdings].style.format({
+                "Quantity": "{:.4f}", # Increased precision for quantity
+                f"Avg. Buy Price ({display_currency})": "{:,.2f}",
+                f"Cost Basis ({display_currency})": "{:,.2f}",
+                f"Current Price ({display_currency})": "{:,.2f}",
+                f"Market Value ({display_currency})": "{:,.2f}",
+                f"Unrealized P/L ({display_currency})": "{:,.2f}",
+                "% Unrealized P/L": "{:.2f}%"
+            }).applymap(lambda val: 'color: red' if isinstance(val, (float, int)) and val < 0 and isinstance(val, (float, int)) else ('color: green' if isinstance(val, (float, int)) and val > 0 else ''),
+                        subset=[f'Unrealized P/L ({display_currency})', '% Unrealized P/L']))
+        else:
+            st.info("No current active holdings to display.")
+
+    with tab3:
+        st.subheader(" Completed Transactions (Sales)")
+        st.markdown(f"_(Monetary values displayed in {display_currency})_")
+        if not df_completed_transactions.empty:
+            df_completed_display = df_completed_transactions.copy()
+            usd_cols_completed = ['Avg. Buy Price (USD)', 'Sell Price p.s. (USD)', 
+                                  'Cost Basis Sold (USD)', 'Total Proceeds (USD)', 'Realized P/L (USD)']
+            for col_usd in usd_cols_completed:
+                new_col_name = col_usd.replace(" (USD)", f" ({display_currency})")
+                df_completed_display[new_col_name] = df_completed_display[col_usd].apply(
+                    lambda x: convert_usd_to_display_currency(x, display_currency, eur_usd_live_rate)
+                )
+
+            display_cols_completed = ['Date', 'Ticker', 'Quantity Sold', f'Avg. Buy Price ({display_currency})',
+                                      f'Sell Price p.s. ({display_currency})', f'Cost Basis Sold ({display_currency})',
+                                      f'Total Proceeds ({display_currency})', f'Realized P/L ({display_currency})']
+
+            st.dataframe(df_completed_display[display_cols_completed].style.format({
+                "Quantity Sold": "{:.4f}",
+                f"Avg. Buy Price ({display_currency})": "{:,.2f}",
+                f"Sell Price p.s. ({display_currency})": "{:,.2f}",
+                f"Cost Basis Sold ({display_currency})": "{:,.2f}",
+                f"Total Proceeds ({display_currency})": "{:,.2f}",
+                f"Realized P/L ({display_currency})": "{:,.2f}",
+                "Date": "{:%Y-%m-%d}"
+            }).applymap(lambda val: 'color: red' if isinstance(val, (float, int)) and val < 0 else ('color: green' if isinstance(val, (float, int)) and val > 0 else ''),
+                        subset=[f'Realized P/L ({display_currency})']))
+        else:
+            st.info("No completed (sell) transactions to display.")
+
+    with tab4:
+        st.subheader(" Processed Transaction Data")
+        st.markdown("View your transactions after processing. 'Amount' and 'Price_per_share_USD' are normalized to USD. Original values are preserved.")
+        
+        display_cols_all_tx = ['Date', 'Ticker', 'Type', 'Quantity', 'Price per share',
+                               'Original_Currency', 'Original_Amount', 'FX Rate',
+                               'Amount', 'Price_per_share_USD'] # Amount is Amount_USD
+        
+        # Filter to columns that actually exist in df_analysis to prevent errors
+        display_cols_all_tx_filtered = [col for col in display_cols_all_tx if col in df_analysis.columns]
+        
+        st.dataframe(df_analysis[display_cols_all_tx_filtered].sort_values(by='Date', ascending=False).style.format({
+            "Original_Amount": "{:,.2f}", "Amount": "${:,.2f}",
             "Price per share": "{:,.2f}", "Price_per_share_USD": "${:,.2f}",
-            "FX Rate": "{:.4f}", "Quantity": "{:.4f}" # Increased precision for quantity
+            "FX Rate": "{:.4f}", "Quantity": "{:.4f}",
+            "Date": "{:%Y-%m-%d %H:%M:%S}"
         }))
 
-    elif df_transactions_loaded is not None and df_transactions_loaded.empty:
-        st.warning("The uploaded Excel file resulted in no processable transaction data (e.g., all rows had critical missing values).")
-    elif uploaded_file and df_transactions_loaded is None: # Error during load_data
-        st.error("Failed to load or process the Excel file. Check console for specific errors if running locally, or ensure file format and essential columns like 'Date', 'Total Amount', 'Type' are correct.")
-else:
-    st.info("👈 Upload your brokerage transaction Excel file to begin analysis.")
+    with tab5:
+        st.subheader(" Visualizations")
+        st.markdown(f"_(Charts display values in USD)_") # Charts primarily use the 'Amount' (USD) column
+
+        # Asset Allocation Pie Chart
+        if not df_holdings.empty and 'Market Value (USD)' in df_holdings.columns:
+            st.markdown("#### Asset Allocation by Market Value (USD)")
+            # Ensure Market Value is numeric and positive for chart
+            df_holdings_chart = df_holdings[df_holdings['Market Value (USD)'] > 0].copy()
+            if not df_holdings_chart.empty:
+                pie_chart = alt.Chart(df_holdings_chart).mark_arc(innerRadius=50).encode(
+                    theta=alt.Theta(field="Market Value (USD)", type="quantitative", stack=True),
+                    color=alt.Color(field="Ticker", type="nominal"),
+                    tooltip=['Ticker', alt.Tooltip('Market Value (USD):Q', format='$,.2f')]
+                ).properties(
+                    title='Current Holdings by Market Value (USD)'
+                )
+                st.altair_chart(pie_chart, use_container_width=True)
+            else:
+                st.info("No holdings with positive market value to display in pie chart.")
+        
+        # Realized P/L Over Time
+        if not df_completed_transactions.empty and 'Realized P/L (USD)' in df_completed_transactions.columns:
+            st.markdown("#### Monthly Realized P/L from Sales (USD)")
+            realized_pl_monthly = df_completed_transactions.copy()
+            realized_pl_monthly['Month'] = realized_pl_monthly['Date'].dt.to_period('M').astype(str)
+            realized_pl_summary = realized_pl_monthly.groupby('Month')['Realized P/L (USD)'].sum().reset_index()
+            
+            pl_chart = alt.Chart(realized_pl_summary).mark_bar().encode(
+                x=alt.X('Month:O', title='Month', sort=None),
+                y=alt.Y('Realized P/L (USD):Q', title='Realized P/L (USD)'),
+                color=alt.condition(
+                    alt.datum['Realized P/L (USD)'] > 0,
+                    alt.value('green'), # Positive P/L
+                    alt.value('red')    # Negative P/L
+                ),
+                tooltip=[alt.Tooltip('Month:O'), alt.Tooltip('Realized P/L (USD):Q', format='$,.2f')]
+            ).properties(
+                title='Monthly Realized P/L (USD)'
+            )
+            st.altair_chart(pl_chart, use_container_width=True)
+
+        # Monthly Deposits Chart
+        CASH_TOP_UP_TYPES = ['CASH TOP-UP', 'DEPOSIT', 'WIRE IN'] # Ensure consistent definition
+        deposits_df = df_analysis[df_analysis['Type'].str.upper().isin(CASH_TOP_UP_TYPES)].copy()
+        if not deposits_df.empty:
+            st.markdown("#### Monthly Cash Deposits (USD)")
+            deposits_df['Month'] = deposits_df['Date'].dt.to_period('M').astype(str)
+            deposits_over_time = deposits_df.groupby('Month')['Amount'].sum().reset_index() # Amount is USD
+            chart_deposits = alt.Chart(deposits_over_time).mark_bar().encode(
+                x=alt.X('Month:O', title='Month', sort=None),
+                y=alt.Y('Amount:Q', title='Total Deposits (USD)'),
+                tooltip=[alt.Tooltip('Month:O'), alt.Tooltip('Amount:Q', title='Deposits (USD)', format='$,.2f')]
+            ).properties(title='Monthly Cash Deposits (USD)')
+            st.altair_chart(chart_deposits, use_container_width=True)
+
+        # Monthly Buy vs Sell Activity
+        BUY_SELL_TYPES = ['BUY - MARKET', 'BUY', 'SELL - MARKET', 'SELL'] # Ensure consistent definition
+        buys_sells_df = df_analysis[df_analysis['Type'].isin(BUY_SELL_TYPES)].copy()
+        if not buys_sells_df.empty:
+            st.markdown("#### Monthly Buy vs. Sell Activity (Value in USD)")
+            buys_sells_df['Month'] = buys_sells_df['Date'].dt.to_period('M').astype(str)
+            # Separate buy and sell for clarity in unstack
+            buys_sells_df['Tx_Category'] = buys_sells_df['Type'].apply(lambda x: 'Buy' if 'BUY' in x else ('Sell' if 'SELL' in x else 'Other'))
+            buys_sells_over_time = buys_sells_df.groupby(['Month', 'Tx_Category'])['Amount'].sum().unstack(fill_value=0).reset_index()
+
+            # Ensure 'Buy' and 'Sell' columns exist even if no transactions of that type in a month
+            if 'Buy' not in buys_sells_over_time.columns: buys_sells_over_time['Buy'] = 0
+            if 'Sell' not in buys_sells_over_time.columns: buys_sells_over_time['Sell'] = 0
+
+            buys_sells_over_time_melted = buys_sells_over_time.melt(id_vars=['Month'], value_vars=['Buy', 'Sell'], var_name='Transaction Category', value_name='Total Amount (USD)')
+            
+            chart_buys_sells = alt.Chart(buys_sells_over_time_melted).mark_line(point=True).encode(
+                x=alt.X('Month:O', title='Month', sort=None),
+                y=alt.Y('Total Amount (USD):Q', title='Total Transaction Amount (USD)'),
+                color='Transaction Category:N',
+                tooltip=[alt.Tooltip('Month:O'), 'Transaction Category', alt.Tooltip('Total Amount (USD):Q', format='$,.2f')]
+            ).properties(title='Monthly Buy vs. Sell Activity (Value in USD)')
+            st.altair_chart(chart_buys_sells, use_container_width=True)
+
+        # Dividend Income Over Time (Optional)
+        DIVIDEND_TYPES = ['DIVIDEND', 'DIVIDEND INCOME']
+        dividends_df = df_analysis[df_analysis['Type'].isin(DIVIDEND_TYPES)].copy()
+        if not dividends_df.empty:
+            st.markdown("#### Monthly Dividend Income (USD)")
+            dividends_df['Month'] = dividends_df['Date'].dt.to_period('M').astype(str)
+            dividends_over_time = dividends_df.groupby('Month')['Amount'].sum().reset_index()
+            chart_dividends = alt.Chart(dividends_over_time).mark_bar().encode(
+                x=alt.X('Month:O', title='Month', sort=None),
+                y=alt.Y('Amount:Q', title='Total Dividends (USD)'),
+                tooltip=[alt.Tooltip('Month:O'), alt.Tooltip('Amount:Q', title='Dividends (USD)', format='$,.2f')]
+            ).properties(title='Monthly Dividend Income (USD)')
+            st.altair_chart(chart_dividends, use_container_width=True)
+
+
+elif not uploaded_file and not st.session_state.manual_entries:
+    st.info("👈 Upload your brokerage transaction file or add transactions manually to begin analysis.")
+elif st.session_state.transactions_df is not None and st.session_state.transactions_df.empty:
+     st.warning("No processable transaction data found. Please upload a file with valid transactions or add them manually.")
+elif st.session_state.transactions_df is None: # Error during load_data or normalization
+        st.error("Failed to load or process transaction data. Check error messages above or ensure file format and essential columns are correct.")
+
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("""
 **Disclaimers & Notes:**
-* This app uses the **Average Cost Basis** method for P&L calculations on sales and for valuing current holdings.
-* Transactions are processed chronologically by 'Date'. Ensure your data is accurate.
-* Live market prices from Yahoo Finance are subject to delays. Tickers ending in 'Q' are assumed to have $0 value.
-* Currency conversions rely on 'FX Rate' in your file. 'Total Invested in EUR' (etc.) refers to original buy amounts in that currency.
-* This tool is for informational purposes only, not financial advice.
+* **Average Cost Basis:** Used for P&L on sales and current holdings.
+* **Data Accuracy:** Assumes chronological 'Date' and correct transaction details.
+* **Live Prices:** From Yahoo Finance (delayed). 'Q' tickers valued at $0. Fallbacks used if live price fails.
+* **Currency:** Core calculations in USD. Display currency conversion uses live EUR/USD rate. 'Total Invested in EUR' (etc.) refers to original buy amounts in that currency.
+* **Not Financial Advice:** For informational purposes only.
 """)
+
+st.markdown("---")
+st.caption(f"Brokerage Account Analyzer Pro | Last Refresh: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
