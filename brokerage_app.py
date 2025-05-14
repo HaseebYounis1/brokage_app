@@ -579,11 +579,14 @@ if 'transactions_df' in st.session_state and st.session_state.transactions_df is
         display_cols_all_tx_filtered = [col for col in display_cols_all_tx if col in df_analysis.columns]
         # Create a copy for display to avoid modifying df_analysis directly if needed elsewhere
         df_display_all_tx = df_analysis[display_cols_all_tx_filtered].sort_values(by='Date', ascending=False).copy()
+        for col in ['Original_Amount', 'Amount', 'Price per share', 'Price_per_share_USD', 'FX Rate', 'Quantity']:
+            if col in df_display_all_tx.columns:
+                df_display_all_tx[col] = pd.to_numeric(df_display_all_tx[col], errors='coerce')
 
         # Convert Date to string, NaT will become 'NaT'
         if 'Date' in df_display_all_tx.columns:
             df_display_all_tx['Date'] = df_display_all_tx['Date'].astype(str) 
-
+        print(df_display_all_tx['Date'])
         st.dataframe(df_display_all_tx.style.format({
             "Original_Amount": "{:,.2f}", "Amount": "${:,.2f}",
             "Price per share": "{:,.2f}", "Price_per_share_USD": "${:,.2f}",
